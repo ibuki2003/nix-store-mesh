@@ -19,10 +19,35 @@ pub async fn nix_serve_app() -> Router<()> {
     Router::new()
         .without_v07_checks()
         .route("/nix-cache-info", get(nix_cache_info))
-        .route("/:hash.narinfo", get(narinfo))
-        .route("/nar/:hash-:expected.nar", get(nar_with_hash))
-        .route("/nar/:hash.nar", get(nar_without_hash))
-        .route("/log/:store_name", get(log_stream))
+        .route("/nar/{*path}", get(nar_handler))
+        .route("/log/{store_name}", get(log_stream))
+        .route("/{path}", get(path_handler))
+}
+
+/// handler for /{hash}.narinfo
+async fn path_handler(Path(path): Path<String>) -> Result<Response<Body>, StatusCode> {
+    if let Some(hash) = path.strip_suffix(".narinfo") {
+        narinfo(hash).await
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+/// handler for /nar/{hash}-{expected}.nar and /nar/{hash}.nar
+async fn nar_handler(Path(path): Path<String>) -> Result<Response<Body>, StatusCode> {
+    let Some(base) = path.strip_suffix(".nar") else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    // if let Some((hash_part, expected)) = base.rsplit_once('-') {
+    // /nar/h0pbmj3hw62blpqfwzi7lvq2jkridpxv-
+    if base.get(32..33) == Some("-") {
+        let hash_part = &base[..32];
+        let expected = &base[33..];
+        nar_with_hash(hash_part, expected).await
+    } else {
+        nar_without_hash(base).await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,8 +118,8 @@ async fn nix_cache_info() -> impl IntoResponse {
         .unwrap()
 }
 
-async fn narinfo(Path(hash_part): Path<String>) -> Result<Response<Body>, StatusCode> {
-    let store_path = query_store_path(&hash_part).await?;
+async fn narinfo(hash_part: &str) -> Result<Response<Body>, StatusCode> {
+    let store_path = query_store_path(hash_part).await?;
     let info = query_path_info(&store_path).await?;
 
     let nar_hash_short = info
@@ -133,10 +158,8 @@ async fn narinfo(Path(hash_part): Path<String>) -> Result<Response<Body>, Status
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn nar_with_hash(
-    Path((hash_part, expected_hash)): Path<(String, String)>,
-) -> Result<Response<Body>, StatusCode> {
-    let store_path = query_store_path(&hash_part).await?;
+async fn nar_with_hash(hash_part: &str, expected_hash: &str) -> Result<Response<Body>, StatusCode> {
+    let store_path = query_store_path(hash_part).await?;
     let info = query_path_info(&store_path).await?;
 
     let actual = info
@@ -144,37 +167,18 @@ async fn nar_with_hash(
         .strip_prefix("sha256:")
         .unwrap_or(&info.nar_hash);
     if actual != expected_hash {
+        eprintln!("Expected hash: {}, actual hash: {}", expected_hash, actual);
         return Err(StatusCode::NOT_FOUND);
     }
 
-    stream_command(
-        Command::new("nix")
-            .arg("--extra-experimental-features")
-            .arg("nix-command")
-            .arg("store")
-            .arg("dump-path")
-            .arg("--")
-            .arg(&store_path),
-        info.nar_size,
-    )
-    .await
+    stream_nar(&store_path, info.nar_size).await
 }
 
-async fn nar_without_hash(Path(hash_part): Path<String>) -> Result<Response<Body>, StatusCode> {
-    let store_path = query_store_path(&hash_part).await?;
+async fn nar_without_hash(hash_part: &str) -> Result<Response<Body>, StatusCode> {
+    let store_path = query_store_path(hash_part).await?;
     let info = query_path_info(&store_path).await?;
 
-    stream_command(
-        Command::new("nix")
-            .arg("--extra-experimental-features")
-            .arg("nix-command")
-            .arg("store")
-            .arg("dump-path")
-            .arg("--")
-            .arg(&store_path),
-        info.nar_size,
-    )
-    .await
+    stream_nar(&store_path, info.nar_size).await
 }
 
 async fn log_stream(Path(store_name): Path<String>) -> Result<Response<Body>, StatusCode> {
@@ -192,6 +196,20 @@ async fn log_stream(Path(store_name): Path<String>) -> Result<Response<Body>, St
 
 fn strip_path(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+async fn stream_nar(store_path: &str, size: u64) -> Result<Response<Body>, StatusCode> {
+    stream_command(
+        Command::new("nix")
+            .arg("--extra-experimental-features")
+            .arg("nix-command")
+            .arg("store")
+            .arg("dump-path")
+            .arg("--")
+            .arg(store_path),
+        size,
+    )
+    .await
 }
 
 async fn stream_command(
