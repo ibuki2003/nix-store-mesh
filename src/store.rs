@@ -1,9 +1,10 @@
 use axum::{
     Router,
     body::Body,
-    http::{Request, Response, StatusCode, header},
+    extract::Path,
+    http::{Response, StatusCode, header},
     response::IntoResponse,
-    routing::{any, get},
+    routing::get,
 };
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -17,68 +18,10 @@ static STORE_DIR: Lazy<String> =
 pub async fn nix_serve_app() -> Router<()> {
     Router::new()
         .route("/nix-cache-info", get(nix_cache_info))
-        .route("/{*path}", any(handler))
-}
-
-async fn handler(req: Request<Body>) -> Result<Response<Body>, StatusCode> {
-    let path = req.uri().path();
-
-    if let Some(hash_part) = parse_narinfo(path) {
-        return narinfo(&hash_part).await;
-    }
-
-    if let Some((hash_part, expected_hash)) = parse_nar_with_hash(path) {
-        return nar_stream(&hash_part, Some(expected_hash)).await;
-    }
-
-    if let Some(hash_part) = parse_nar_without_hash(path) {
-        return nar_stream(&hash_part, None).await;
-    }
-
-    if let Some(store_name) = parse_log(path) {
-        return log_stream(&store_name).await;
-    }
-
-    Err(StatusCode::NOT_FOUND)
-}
-
-fn parse_narinfo(path: &str) -> Option<String> {
-    if !path.ends_with(".narinfo") {
-        return None;
-    }
-    let trimmed = path.trim_start_matches('/');
-    trimmed.strip_suffix(".narinfo").map(|s| s.to_string())
-}
-
-fn parse_nar_with_hash(path: &str) -> Option<(String, String)> {
-    if !path.starts_with("/nar/") || !path.ends_with(".nar") {
-        return None;
-    }
-    let body = &path[5..path.len() - 4]; // strip "/nar/" and ".nar"
-    let (hash_part, expected_hash) = body.split_once('-')?;
-    Some((hash_part.to_string(), expected_hash.to_string()))
-}
-
-fn parse_nar_without_hash(path: &str) -> Option<String> {
-    if !path.starts_with("/nar/") || !path.ends_with(".nar") {
-        return None;
-    }
-    let body = &path[5..path.len() - 4];
-    if body.contains('-') {
-        return None; // handled by parse_nar_with_hash
-    }
-    Some(body.to_string())
-}
-
-fn parse_log(path: &str) -> Option<String> {
-    if !path.starts_with("/log/") {
-        return None;
-    }
-    let body = &path[5..];
-    if body.is_empty() {
-        return None;
-    }
-    Some(body.to_string())
+        .route("/:hash.narinfo", get(narinfo))
+        .route("/nar/:hash-:expected.nar", get(nar_with_hash))
+        .route("/nar/:hash.nar", get(nar_without_hash))
+        .route("/log/:store_name", get(log_stream))
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,8 +92,8 @@ async fn nix_cache_info() -> impl IntoResponse {
         .unwrap()
 }
 
-async fn narinfo(hash_part: &str) -> Result<Response<Body>, StatusCode> {
-    let store_path = query_store_path(hash_part).await?;
+async fn narinfo(Path(hash_part): Path<String>) -> Result<Response<Body>, StatusCode> {
+    let store_path = query_store_path(&hash_part).await?;
     let info = query_path_info(&store_path).await?;
 
     let nar_hash_short = info
@@ -189,21 +132,18 @@ async fn narinfo(hash_part: &str) -> Result<Response<Body>, StatusCode> {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn nar_stream(
-    hash_part: &str,
-    expected_hash: Option<String>,
+async fn nar_with_hash(
+    Path((hash_part, expected_hash)): Path<(String, String)>,
 ) -> Result<Response<Body>, StatusCode> {
-    let store_path = query_store_path(hash_part).await?;
+    let store_path = query_store_path(&hash_part).await?;
     let info = query_path_info(&store_path).await?;
 
-    if let Some(expected) = expected_hash.as_ref() {
-        let actual = info
-            .nar_hash
-            .strip_prefix("sha256:")
-            .unwrap_or(&info.nar_hash);
-        if actual != expected {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    let actual = info
+        .nar_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(&info.nar_hash);
+    if actual != expected_hash {
+        return Err(StatusCode::NOT_FOUND);
     }
 
     stream_command(
@@ -219,7 +159,24 @@ async fn nar_stream(
     .await
 }
 
-async fn log_stream(store_name: &str) -> Result<Response<Body>, StatusCode> {
+async fn nar_without_hash(Path(hash_part): Path<String>) -> Result<Response<Body>, StatusCode> {
+    let store_path = query_store_path(&hash_part).await?;
+    let info = query_path_info(&store_path).await?;
+
+    stream_command(
+        Command::new("nix")
+            .arg("--extra-experimental-features")
+            .arg("nix-command")
+            .arg("store")
+            .arg("dump-path")
+            .arg("--")
+            .arg(&store_path),
+        info.nar_size,
+    )
+    .await
+}
+
+async fn log_stream(Path(store_name): Path<String>) -> Result<Response<Body>, StatusCode> {
     let store_path = format!("{}/{}", *STORE_DIR, store_name);
     stream_command(
         Command::new("nix")
