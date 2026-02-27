@@ -38,7 +38,7 @@ async fn check_reachable(host: &str) -> bool {
 
     // HTTP GET {host}/nix-store-info with timeout
     let req = CLIENT
-        .get(format!("http://{}/nix-store-info", host))
+        .get(format!("http://{}/nix-cache-info", host))
         .build()
         .unwrap();
     let res = CLIENT.execute(req).await;
