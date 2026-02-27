@@ -17,6 +17,7 @@ static STORE_DIR: Lazy<String> =
 
 pub async fn nix_serve_app() -> Router<()> {
     Router::new()
+        .without_v07_checks()
         .route("/nix-cache-info", get(nix_cache_info))
         .route("/:hash.narinfo", get(narinfo))
         .route("/nar/:hash-:expected.nar", get(nar_with_hash))
