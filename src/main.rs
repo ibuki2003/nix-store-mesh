@@ -10,6 +10,7 @@ use axum::{
 
 use nix_store_mesh::{remote::try_forward, store::nix_serve_app};
 use tower::{ServiceExt as _, service_fn};
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +20,9 @@ async fn main() {
         .route("/{*path}", any(handler));
 
     // service for remote; nix-serve
-    let app_remote = nix_serve_app().await;
+    let app_remote = nix_serve_app()
+        .await
+        .layer(CompressionLayer::new().quality(CompressionLevel::Default));
 
     let dispatch = service_fn(move |req: Request<Body>| {
         let local = app_local.clone();
