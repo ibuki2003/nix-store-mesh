@@ -1,7 +1,8 @@
-use std::{error::Error, path::PathBuf};
+use std::{error::Error, net::SocketAddr, path::PathBuf};
 
-use axum::{body::Body, http::Request};
+use axum::{Router, body::Body, extract::ConnectInfo, http::Request};
 use nix_store_mesh::{config::Config, remote::Mesh, store::nix_serve_app};
+use tower::{ServiceExt as _, service_fn};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 #[tokio::main]
@@ -25,24 +26,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?,
     };
     let config = Config::load(path).await?;
-    let local_listener = tokio::net::TcpListener::bind(config.local_listen).await?;
-    let peer_listener = tokio::net::TcpListener::bind(config.peer_listen).await?;
-
-    let app_local = Mesh::new(&config)
-        .router()
-        .layer(axum::middleware::from_fn(logging_middleware));
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let hostname = hostname::get()?
+        .into_string()
+        .map_err(|_| "hostname is not UTF-8")?;
+    let app_local = Mesh::new(&config, &hostname).router();
     let app_peer = nix_serve_app()
         .await
-        .layer(CompressionLayer::new().quality(CompressionLevel::Fastest))
-        .layer(axum::middleware::from_fn(logging_middleware));
+        .layer(CompressionLayer::new().quality(CompressionLevel::Fastest));
 
-    log::debug!("Local cache: http://{}", config.local_listen);
-    log::debug!("Peer service: http://{}", config.peer_listen);
-    tokio::try_join!(
-        async { axum::serve(local_listener, app_local).await },
-        async { axum::serve(peer_listener, app_peer).await },
-    )?;
+    let app =
+        dispatch_app(app_local, app_peer).layer(axum::middleware::from_fn(logging_middleware));
+    log::debug!("Listening on {} as {hostname}", config.listen);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+fn dispatch_app(local: Router, peer: Router) -> Router {
+    Router::new().fallback_service(service_fn(move |req: Request<Body>| {
+        let is_loopback = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(addr)| match addr.ip() {
+                std::net::IpAddr::V4(ip) => ip.is_loopback(),
+                std::net::IpAddr::V6(ip) => ip
+                    .to_ipv4_mapped()
+                    .map_or_else(|| ip.is_loopback(), |ip| ip.is_loopback()),
+            });
+        let app = if is_loopback {
+            local.clone()
+        } else {
+            peer.clone()
+        };
+        async move { app.oneshot(req).await }
+    }))
 }
 
 fn default_config_path(
@@ -70,6 +91,30 @@ pub async fn logging_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dispatches_only_loopback_to_the_local_cache() {
+        let local = Router::new().route("/test", axum::routing::get(|| async { "local" }));
+        let peer = Router::new().route("/test", axum::routing::get(|| async { "peer" }));
+        let app = dispatch_app(local, peer);
+        for (address, expected) in [
+            ("127.0.0.1:1234", "local"),
+            ("[::1]:1234", "local"),
+            ("[::ffff:127.0.0.1]:1234", "local"),
+            ("100.100.1.2:1234", "peer"),
+            ("192.168.1.2:1234", "peer"),
+        ] {
+            let mut request = Request::builder().uri("/test").body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(address.parse::<SocketAddr>().unwrap()));
+            let response = app.clone().oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_bytes(), "{address}");
+        }
+    }
 
     #[test]
     fn default_config_uses_xdg_then_home() {

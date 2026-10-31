@@ -9,6 +9,20 @@ use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 
 const HASH: &str = "00000000000000000000000000000000";
+
+#[tokio::test]
+async fn excludes_only_the_matching_hostname() {
+    let config: Config = toml::from_str(
+        "listen = '0.0.0.0'\n[hosts]\nself-host = 'self.example.ts.net'\nother = 'other.example.ts.net'\n",
+    ).unwrap();
+    let mesh = Mesh::new(&config, "self-host");
+    assert_eq!(
+        mesh.peers.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["other"]
+    );
+    let mesh = Mesh::new(&config, "not-listed");
+    assert_eq!(mesh.peers.len(), 2);
+}
 const NARINFO: &str = "StorePath: /nix/store/00000000000000000000000000000000-test\nURL: nar/test.nar\nCompression: none\nNarHash: sha256:test\nNarSize: 7\nSig: test:signature\n";
 
 struct TestServer {

@@ -8,11 +8,9 @@ const DEFAULT_PORT: u16 = 9722;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "deserialize_listen")]
-    pub local_listen: SocketAddr,
-    #[serde(deserialize_with = "deserialize_listen")]
-    pub peer_listen: SocketAddr,
+    pub listen: SocketAddr,
     #[serde(default, deserialize_with = "deserialize_peers")]
-    pub peers: BTreeMap<String, String>,
+    pub hosts: BTreeMap<String, String>,
 }
 
 fn deserialize_listen<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SocketAddr, D::Error> {
@@ -49,17 +47,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if !self.local_listen.ip().is_loopback() {
-            return Err("local_listen must be a loopback address".into());
-        }
-        if !is_tailnet_ip(self.peer_listen.ip()) {
-            return Err("peer_listen must be a Tailscale address".into());
-        }
-        for (name, address) in &self.peers {
+        for (name, address) in &self.hosts {
             if name.is_empty()
                 || !name
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
             {
                 return Err(format!("invalid peer name: {name}"));
             }
@@ -88,9 +80,8 @@ mod tests {
     fn config() -> Config {
         toml::from_str(
             r#"
-local_listen = "127.0.0.1:3000"
-peer_listen = "100.100.1.2:3000"
-[peers]
+listen = "0.0.0.0:3000"
+[hosts]
 desktop = "desktop.example.ts.net:3000"
 "#,
         )
@@ -113,9 +104,8 @@ desktop = "desktop.example.ts.net:3000"
     fn defaults_ports_and_preserves_explicit_ports() {
         let c: Config = toml::from_str(
             r#"
-local_listen = "127.0.0.1"
-peer_listen = "fd7a:115c:a1e0::1"
-[peers]
+listen = "0.0.0.0"
+[hosts]
 desktop = "desktop.example.ts.net"
 ipv4 = "100.100.1.2"
 ipv6 = "[fd7a:115c:a1e0::2]"
@@ -124,32 +114,24 @@ custom = "other.example.ts.net:1234"
         )
         .unwrap();
         c.validate().unwrap();
-        assert_eq!(c.local_listen, "127.0.0.1:9722".parse().unwrap());
-        assert_eq!(c.peer_listen, "[fd7a:115c:a1e0::1]:9722".parse().unwrap());
-        assert_eq!(c.peers["desktop"], "desktop.example.ts.net:9722");
-        assert_eq!(c.peers["ipv4"], "100.100.1.2:9722");
-        assert_eq!(c.peers["ipv6"], "[fd7a:115c:a1e0::2]:9722");
-        assert_eq!(c.peers["custom"], "other.example.ts.net:1234");
+        assert_eq!(c.listen, "0.0.0.0:9722".parse().unwrap());
+        assert_eq!(c.hosts["desktop"], "desktop.example.ts.net:9722");
+        assert_eq!(c.hosts["ipv4"], "100.100.1.2:9722");
+        assert_eq!(c.hosts["ipv6"], "[fd7a:115c:a1e0::2]:9722");
+        assert_eq!(c.hosts["custom"], "other.example.ts.net:1234");
         let explicit = config();
-        assert_eq!(explicit.local_listen.port(), 3000);
-        assert_eq!(explicit.peer_listen.port(), 3000);
+        assert_eq!(explicit.listen.port(), 3000);
     }
 
     #[test]
-    fn rejects_public_listeners_and_invalid_peers() {
-        let mut c = config();
-        c.local_listen = "0.0.0.0:3000".parse().unwrap();
-        assert!(c.validate().is_err());
-        c = config();
-        c.peer_listen = "192.168.1.2:3000".parse().unwrap();
-        assert!(c.validate().is_err());
+    fn rejects_invalid_hosts() {
         for address in ["http://desktop:3000", "desktop", "user@desktop:3000"] {
-            c = config();
-            c.peers.insert("desktop".into(), address.into());
+            let mut c = config();
+            c.hosts.insert("desktop".into(), address.into());
             assert!(c.validate().is_err(), "{address}");
         }
-        c = config();
-        c.peers.insert("../desktop".into(), "desktop:3000".into());
+        let mut c = config();
+        c.hosts.insert("../desktop".into(), "desktop:3000".into());
         assert!(c.validate().is_err());
     }
 }

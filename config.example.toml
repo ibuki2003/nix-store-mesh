@@ -1,6 +1,5 @@
-local_listen = "127.0.0.1"
-peer_listen = "100.100.1.2"
+listen = "0.0.0.0"
 
-[peers]
+[hosts]
 desktop = "desktop.example.ts.net"
 laptop = "laptop.example.ts.net"

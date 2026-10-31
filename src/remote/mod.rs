@@ -200,10 +200,11 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, hostname: &str) -> Self {
         let peers = config
-            .peers
+            .hosts
             .iter()
+            .filter(|(name, _)| name.as_str() != hostname)
             .map(|(name, address)| {
                 let peer = Peer::spawn(
                     name.clone(),
