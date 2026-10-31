@@ -108,7 +108,7 @@ async fn query_path_info(store_path: &str) -> Result<PathInfo, StatusCode> {
     serde_json::from_value(entry.clone()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn nix_cache_info() -> impl IntoResponse {
+pub(crate) async fn nix_cache_info() -> impl IntoResponse {
     let body = format!("StoreDir: {}\nWantMassQuery: 1\nPriority: 30\n", *STORE_DIR);
     Response::builder()
         .status(StatusCode::OK)
@@ -167,7 +167,7 @@ async fn nar_with_hash(hash_part: &str, expected_hash: &str) -> Result<Response<
         .strip_prefix("sha256:")
         .unwrap_or(&info.nar_hash);
     if actual != expected_hash {
-        eprintln!("Expected hash: {}, actual hash: {}", expected_hash, actual);
+        log::debug!("Expected hash: {}, actual hash: {}", expected_hash, actual);
         return Err(StatusCode::NOT_FOUND);
     }
 

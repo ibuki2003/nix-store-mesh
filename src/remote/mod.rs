@@ -1,177 +1,384 @@
 use axum::{
-    body::Body,
-    http::{Request, Response},
+    Router,
+    body::{Body, to_bytes},
+    extract::{OriginalUri, Path, State},
+    http::{HeaderValue, Request, Response, StatusCode, Uri, header, uri::Authority},
+    routing::get,
 };
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
-use std::time::Instant;
-use tokio::sync::{Mutex, oneshot};
+use hyper::{body::Incoming, client::conn::http2};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::{
+    collections::BTreeMap,
+    io,
+    net::IpAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    net::{TcpStream, lookup_host},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    time::{sleep, timeout},
+};
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-const REACHABLE_CACHE_TTL_SECS: u64 = 300;
-const REACHABLE_TIMEOUT_MS: u64 = 500;
+use crate::config::{Config, is_tailnet_ip};
 
-static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(REACHABLE_TIMEOUT_MS))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-});
+#[cfg(test)]
+mod tests;
 
-struct CacheEntry {
-    value: bool,
-    checked_at: Instant,
-    checking: bool,
-    waiters: Vec<oneshot::Sender<bool>>,
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_NARINFO_SIZE: usize = 1024 * 1024;
+const MAX_TRANSFERS: usize = 4;
+
+type PeerResponse = Response<Incoming>;
+
+struct Connection {
+    sender: http2::SendRequest<Body>,
+    failed: CancellationToken,
+    transfers: Arc<Semaphore>,
 }
 
-static CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
-async fn check_reachable(host: &str) -> bool {
-    // at first, check the host is valid
-    if host.is_empty() {
-        return false;
-    }
-    if host.contains('/') || host.contains('\\') {
-        return false;
-    }
-
-    // HTTP GET {host}/nix-store-info with timeout
-    let req = CLIENT
-        .get(format!("http://{}/nix-cache-info", host))
-        .build()
-        .unwrap();
-    let res = CLIENT.execute(req).await;
-    match res {
-        Ok(r) => r.status().is_success(),
-        Err(e) => {
-            eprintln!("{:?}", e);
-            false
-        }
-    }
+struct Peer {
+    authority: Authority,
+    state: watch::Receiver<Option<Arc<Connection>>>,
+    _task: AbortOnDropHandle<()>,
 }
 
-async fn refresh_task(host: String) -> bool {
-    {
-        let mut cache = CACHE.lock().await;
-        let entry = cache.get_mut(&host);
-        if let Some(e) = entry {
-            if e.checking {
-                // someone else is checking: wait for its result
-                let (tx, rx) = oneshot::channel();
-                e.waiters.push(tx);
-                drop(cache);
-                return rx.await.unwrap_or(false);
+impl Peer {
+    fn spawn(name: String, authority: Authority, allowed_ip: fn(IpAddr) -> bool) -> Self {
+        let (state_tx, state) = watch::channel(None);
+        let address = authority.clone();
+        let task = tokio::spawn(async move {
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                if maintain_connection(&name, &address, &state_tx, allowed_ip).await {
+                    retry_delay = Duration::from_secs(1);
+                }
+                state_tx.send_replace(None);
+                sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
             }
-            e.checking = true;
-        } else {
-            // insert new entry
-            cache.insert(
-                host.clone(),
-                CacheEntry {
-                    value: false,
-                    checked_at: Instant::now(),
-                    checking: true,
-                    waiters: Vec::new(),
-                },
-            );
+        });
+        Self {
+            authority,
+            state,
+            _task: AbortOnDropHandle::new(task),
         }
     }
 
-    let res = check_reachable(&host).await;
-    let mut cache = CACHE.lock().await;
-    if let Some(e) = cache.get_mut(&host) {
-        e.value = res;
-        e.checked_at = Instant::now();
-        e.checking = false;
-        for s in e.waiters.drain(..) {
-            let _ = s.send(res);
+    fn connection(&self) -> Option<Arc<Connection>> {
+        self.state.borrow().clone().filter(|connection| {
+            !connection.failed.is_cancelled() && !connection.sender.is_closed()
+        })
+    }
+
+    async fn request(
+        &self,
+        connection: &Connection,
+        path: &str,
+        accept_encoding: Option<HeaderValue>,
+    ) -> Option<PeerResponse> {
+        let mut request = Request::builder().uri(format!("http://{}{path}", self.authority));
+        if let Some(encoding) = accept_encoding {
+            request = request.header(header::ACCEPT_ENCODING, encoding);
         }
-    } else {
-        cache.insert(
-            host.clone(),
-            CacheEntry {
-                value: res,
-                checked_at: Instant::now(),
-                checking: false,
-                waiters: Vec::new(),
-            },
-        );
-    }
-    res
-}
-
-async fn invalidate_cache(host: &str) {
-    let mut cache = CACHE.lock().await;
-    cache.remove(host);
-}
-
-/// Checks if the given host is reachable over the network.
-/// results are cached for performance.
-async fn reachable(host: &str) -> bool {
-    // validate host quickly
-    if host.is_empty() || host.contains('/') || host.contains('\\') {
-        return false;
-    }
-
-    let now = Instant::now();
-    let ttl = std::time::Duration::from_secs(REACHABLE_CACHE_TTL_SECS);
-
-    // Scope for lock
-    {
-        let mut cache = CACHE.lock().await;
-        if let Some(entry) = cache.get_mut(host)
-            && entry.checked_at + ttl > now
-        {
-            // cache still valid: return cached value immediately
-            if !entry.value {
-                // refresh in background
-                tokio::spawn(refresh_task(host.to_string()));
+        let request = request.body(Body::empty()).ok()?;
+        let mut sender = connection.sender.clone();
+        tokio::select! {
+            _ = connection.failed.cancelled() => None,
+            result = timeout(REQUEST_TIMEOUT, sender.send_request(request)) => {
+                match result {
+                    Ok(Ok(response)) => Some(response),
+                    _ => {
+                        connection.failed.cancel();
+                        None
+                    }
+                }
             }
-            entry.value
-        } else {
-            // cache miss
-            drop(cache);
-            refresh_task(host.to_string()).await
         }
     }
 }
 
-pub async fn try_forward(req: Request<Body>) -> Option<Response<Body>> {
-    let path = req.uri().path();
-    let path = &path[1..]; // strip leading '/'
-    println!("{}", path);
-    println!(
-        "accept-encoding: {:?}",
-        req.headers().get("accept-encoding")
+async fn connect(authority: &Authority, allowed_ip: fn(IpAddr) -> bool) -> io::Result<TcpStream> {
+    let mut last_error = io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "peer did not resolve to an allowed address",
     );
-    let host = path.split_once('/')?.0;
-    if !reachable(host).await {
-        println!("Host {} is not reachable", host);
-        return None;
-    }
-    println!("Forwarding request to host: {}", host);
-
-    let freq = CLIENT
-        .request(req.method().clone(), format!("http://{}", path))
-        .build()
-        .unwrap();
-
-    let res = match CLIENT.execute(freq).await {
-        Ok(r) => r,
-        Err(e) => {
-            if e.is_connect() {
-                // invalidate cache
-                invalidate_cache(host).await;
+    for address in lookup_host(authority.as_str()).await? {
+        if !allowed_ip(address.ip()) {
+            continue;
+        }
+        match TcpStream::connect(address).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
             }
-            return None;
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+// Returns true if the peer reached the online state, resetting the reconnect backoff.
+async fn maintain_connection(
+    name: &str,
+    authority: &Authority,
+    state: &watch::Sender<Option<Arc<Connection>>>,
+    allowed_ip: fn(IpAddr) -> bool,
+) -> bool {
+    let stream = match timeout(CONNECT_TIMEOUT, connect(authority, allowed_ip)).await {
+        Ok(Ok(stream)) => stream,
+        result => {
+            log::debug!("Peer {name}: connection failed: {result:?}");
+            return false;
         }
     };
-
-    let mut builder = Response::builder().status(res.status());
-    for (k, v) in res.headers() {
-        builder = builder.header(k, v);
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new())
+        .adaptive_window(true)
+        .keep_alive_interval(PING_INTERVAL)
+        .keep_alive_timeout(PING_TIMEOUT)
+        .keep_alive_while_idle(true);
+    let (mut sender, driver) = match timeout(
+        CONNECT_TIMEOUT,
+        builder.handshake::<_, Body>(TokioIo::new(stream)),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            log::debug!("Peer {name}: HTTP/2 handshake failed: {error}");
+            return false;
+        }
+        Err(_) => {
+            log::debug!("Peer {name}: HTTP/2 handshake timed out");
+            return false;
+        }
+    };
+    tokio::pin!(driver);
+    let request = Request::builder()
+        .uri(format!("http://{authority}/nix-cache-info"))
+        .body(Body::empty())
+        .expect("valid peer URI");
+    let probe = timeout(REQUEST_TIMEOUT, sender.send_request(request));
+    let online = tokio::select! {
+        result = &mut driver => {
+            log::debug!("Peer {name}: disconnected during startup: {result:?}");
+            false
+        }
+        result = probe => matches!(result, Ok(Ok(response)) if response.status().is_success()),
+    };
+    if !online {
+        return false;
     }
-    let body = Body::from_stream(res.bytes_stream());
-    builder.body(body).ok()
+    let failed = CancellationToken::new();
+    state.send_replace(Some(Arc::new(Connection {
+        sender,
+        failed: failed.clone(),
+        transfers: Arc::new(Semaphore::new(MAX_TRANSFERS)),
+    })));
+    log::info!("Peer {name}: connected");
+    tokio::select! {
+        result = &mut driver => log::debug!("Peer {name}: connection ended: {result:?}"),
+        _ = failed.cancelled() => log::debug!("Peer {name}: reconnecting after request failure"),
+    }
+    log::info!("Peer {name}: disconnected");
+    failed.cancel();
+    true
+}
+
+#[derive(Clone)]
+pub struct Mesh {
+    peers: Arc<BTreeMap<String, Peer>>,
+}
+
+impl Mesh {
+    pub fn new(config: &Config) -> Self {
+        let peers = config
+            .peers
+            .iter()
+            .map(|(name, address)| {
+                let peer = Peer::spawn(
+                    name.clone(),
+                    address.parse().expect("validated peer address"),
+                    is_tailnet_ip,
+                );
+                (name.clone(), peer)
+            })
+            .collect();
+        Self {
+            peers: Arc::new(peers),
+        }
+    }
+
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/nix-cache-info", get(crate::store::nix_cache_info))
+            .route("/nar/{peer}/{*path}", get(forward_nar))
+            .route("/log/{store_name}", get(forward_log))
+            .route("/{path}", get(find_narinfo))
+            .with_state(self)
+    }
+}
+
+async fn find_narinfo(
+    State(mesh): State<Mesh>,
+    Path(path): Path<String>,
+) -> Result<Response<Body>, StatusCode> {
+    let Some(hash) = path.strip_suffix(".narinfo") else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if hash.len() != 32
+        || !hash
+            .bytes()
+            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    for (name, peer) in mesh.peers.iter() {
+        let Some(connection) = peer.connection() else {
+            continue;
+        };
+        let Some(response) = peer.request(&connection, &format!("/{path}"), None).await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let bytes = match timeout(
+            REQUEST_TIMEOUT,
+            to_bytes(Body::new(response.into_body()), MAX_NARINFO_SIZE),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            _ => {
+                connection.failed.cancel();
+                continue;
+            }
+        };
+        let Some(body) = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|body| rewrite_narinfo(body, name))
+        else {
+            continue;
+        };
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "text/x-nix-narinfo")
+            .body(Body::from(body))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+fn rewrite_narinfo(body: &str, peer: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut found_url = false;
+    for line in body.lines() {
+        if let Some(url) = line.strip_prefix("URL: ") {
+            if found_url {
+                return None;
+            }
+            let nar = url.strip_prefix("nar/")?;
+            let uri: Uri = format!("/{url}").parse().ok()?;
+            if nar.is_empty()
+                || uri.query().is_some()
+                || uri.path().split('/').any(|segment| segment == "..")
+            {
+                return None;
+            }
+            result.push_str(&format!("URL: nar/{peer}/{nar}\n"));
+            found_url = true;
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    found_url.then_some(result)
+}
+
+async fn forward_nar(
+    State(mesh): State<Mesh>,
+    Path((name, _)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    request: Request<Body>,
+) -> Result<Response<Body>, StatusCode> {
+    let peer = mesh.peers.get(&name).ok_or(StatusCode::NOT_FOUND)?;
+    let connection = peer.connection().ok_or(StatusCode::NOT_FOUND)?;
+    let permit = tokio::select! {
+        permit = connection.transfers.clone().acquire_owned() => {
+            permit.map_err(|_| StatusCode::NOT_FOUND)?
+        }
+        _ = connection.failed.cancelled() => return Err(StatusCode::NOT_FOUND),
+    };
+    let prefix = format!("/nar/{name}/");
+    let suffix = uri
+        .path()
+        .strip_prefix(&prefix)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let response = peer
+        .request(
+            &connection,
+            &format!("/nar/{suffix}"),
+            request.headers().get(header::ACCEPT_ENCODING).cloned(),
+        )
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(
+        parts,
+        Body::new(TransferBody {
+            inner: body,
+            _permit: permit,
+        }),
+    ))
+}
+
+async fn forward_log(
+    State(mesh): State<Mesh>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response<Body>, StatusCode> {
+    for peer in mesh.peers.values() {
+        let Some(connection) = peer.connection() else {
+            continue;
+        };
+        if let Some(response) = peer.request(&connection, uri.path(), None).await
+            && response.status().is_success()
+        {
+            return Ok(response.map(Body::new));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+struct TransferBody {
+    inner: Incoming,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl hyper::body::Body for TransferBody {
+    type Data = <Incoming as hyper::body::Body>::Data;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
